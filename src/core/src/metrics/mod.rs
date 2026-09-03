@@ -14,7 +14,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use config::{
-    meta::promql::{METRICS_HASH_EXCLUDED_LABELS, Metadata},
+    meta::promql::Metadata,
     utils::hash::{Sum64, gxhash},
 };
 use datafusion::arrow::datatypes::Schema;
@@ -81,10 +81,6 @@ pub fn signature_without_labels(
     gxhash::new().sum64(&key)
 }
 
-fn get_exclude_labels() -> &'static [&'static str] {
-    METRICS_HASH_EXCLUDED_LABELS
-}
-
 #[cfg(test)]
 mod tests {
     use config::{meta::promql::METADATA_LABEL, utils::json};
@@ -133,7 +129,7 @@ mod tests {
 
     #[test]
     fn test_get_exclude_labels_contains_known_labels() {
-        let labels = get_exclude_labels();
+        let labels = config::meta::promql::METRICS_HASH_EXCLUDED_LABELS;
         assert!(labels.contains(&"_timestamp"));
         assert!(labels.contains(&"_all"));
         assert!(labels.contains(&"trace_id"));
