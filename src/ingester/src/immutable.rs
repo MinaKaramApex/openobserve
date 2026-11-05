@@ -392,19 +392,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_processing_tables_cache_stats_consistency() {
-        // Test that stats returns valid values across multiple calls
-        // Note: In a concurrent test environment, values may change due to other tests
-        let (total1, used1, len1) = get_processing_tables_cache_stats().await;
-        let (total2, used2, len2) = get_processing_tables_cache_stats().await;
-
-        // Total size should remain consistent
-        assert_eq!(total1, total2);
-
-        // Used size and length may change due to concurrent tests, but should not vary wildly
-        let used_diff = used2.abs_diff(used1);
-        let len_diff = len2.abs_diff(len1);
-        assert!(used_diff < 100000 || used1 == 0 || used2 == 0);
-        assert!(len_diff < 100 || len1 == 0 || len2 == 0);
+        // the shared set can change between calls, so only invariants within each snapshot hold
+        for _ in 0..2 {
+            let (len, capacity, mem_size) = get_processing_tables_cache_stats().await;
+            assert!(len <= capacity);
+            assert!(mem_size > 0);
+        }
     }
 
     #[tokio::test]
@@ -413,9 +406,9 @@ mod tests {
         let immutables_stats = get_immutables_cache_stats().await;
         let processing_stats = get_processing_tables_cache_stats().await;
 
-        // Both should return valid tuples
-        assert!(immutables_stats.1 <= immutables_stats.0);
-        assert!(processing_stats.1 <= processing_stats.0);
+        // Both return (len, capacity, mem_size)
+        assert!(immutables_stats.0 <= immutables_stats.1);
+        assert!(processing_stats.0 <= processing_stats.1);
 
         // Both functions should be callable independently
         let _ = get_immutables_cache_stats().await;
