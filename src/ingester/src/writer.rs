@@ -17,7 +17,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, LazyLock as Lazy,
-        atomic::{AtomicI64, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
 };
 
@@ -59,6 +59,8 @@ pub struct Writer {
     memtable: Arc<RwLock<MemTable>>,
     next_seq: AtomicU64,
     created_at: AtomicI64,
+    // set while a force rotation is queued, so the persist loop does not queue another
+    force_rotate_pending: AtomicBool,
     write_queue: Arc<mpsc::Sender<(WriterSignal, crate::ProcessedBatch, bool)>>,
 }
 
@@ -74,52 +76,63 @@ pub fn check_memtable_size() -> Result<()> {
     }
 }
 
-/// Whether the memtables must be rotated now to free the memtable budget.
+/// Whether the memtable budget is exhausted, so the live memtables must be rotated to free it.
 ///
 /// The budget (`cur_mem`) counts live memtables plus immutables not yet persisted, and it only
 /// shrinks when an immutable is persisted. Once it is exhausted every write is rejected, so no
-/// write arrives to trigger a size rotation. While immutables are pending, persisting them frees
-/// the budget; when none are pending, nothing will until the live memtables are rotated.
-pub(crate) fn should_force_rotate(
-    cur_mem: i64,
-    max_size: usize,
-    pending_immutables: usize,
-) -> bool {
-    cur_mem >= max_size as i64 && pending_immutables == 0
+/// write arrives to trigger a size rotation, and data in the live memtables stays counted until
+/// the ttl check rotates them.
+pub(crate) fn should_force_rotate(cur_mem: i64, max_size: usize) -> bool {
+    cur_mem >= max_size as i64
 }
 
-/// Rotate every non-empty memtable when the memtable budget is exhausted and nothing is left to
-/// persist, so the next persist run frees the budget. Returns whether a rotation was requested.
-pub async fn force_rotate_if_overflow() -> Result<bool> {
+/// Ask every writer holding data to rotate its memtable when the memtable budget is exhausted,
+/// so the next persist run frees the budget. Returns the number of writers signalled.
+///
+/// Immutables already pending do not suppress this: one that keeps failing to persist must not
+/// keep healthy writers from recovering. Writers with an empty memtable or a force rotation
+/// already queued are skipped, so repeated calls do not pile up signals or tiny files.
+pub(crate) async fn force_rotate_if_overflow() -> usize {
     let cur_mem = metrics::INGEST_MEMTABLE_ARROW_BYTES
         .with_label_values::<&str>(&[])
         .get();
     let max_size = get_config().limit.mem_table_max_size;
-    let pending = IMMUTABLES.read().await.len();
-    if !should_force_rotate(cur_mem, max_size, pending) {
-        return Ok(false);
+    if !should_force_rotate(cur_mem, max_size) {
+        return 0;
     }
-    log::warn!(
-        "[INGESTER:MEM] memtable size {cur_mem} reached the limit {max_size} with nothing to persist, force rotating memtables"
-    );
+    let mut signalled = 0;
     for w in WRITERS.iter() {
         let w = w.read().await;
         for r in w.values() {
-            // never block the persist loop: a full queue means writes are still arriving,
-            // and they trigger the size rotation themselves
+            if r.is_channel_closed() || !r.memtable.read().await.has_data() {
+                continue;
+            }
+            if r.force_rotate_pending.swap(true, Ordering::AcqRel) {
+                continue; // a force rotation is already queued for this writer
+            }
+            // never block the persist loop: if the queue is full, the next persist run retries
+            // once it has drained
             if let Err(e) = r.write_queue.try_send((
                 WriterSignal::ForceRotate,
                 crate::ProcessedBatch::empty(),
                 false,
             )) {
+                r.force_rotate_pending.store(false, Ordering::Release);
                 log::warn!(
                     "[INGESTER:MEM:{}] writer queue force rotate skipped: {e}",
                     r.idx
                 );
+                continue;
             }
+            signalled += 1;
         }
     }
-    Ok(true)
+    if signalled > 0 {
+        log::warn!(
+            "[INGESTER:MEM] memtable size {cur_mem} reached the limit {max_size}, force rotating {signalled} memtables"
+        );
+    }
+    signalled
 }
 
 // check total memory size
@@ -364,6 +377,7 @@ impl Writer {
             memtable: Arc::new(RwLock::new(MemTable::new())),
             next_seq,
             created_at: AtomicI64::new(now),
+            force_rotate_pending: AtomicBool::new(false),
             write_queue: Arc::new(tx),
         };
         let writer = Arc::new(writer);
@@ -597,6 +611,8 @@ impl Writer {
     // force_rotate rotates the wal and memtable if the memtable holds any data, regardless of
     // the size and age thresholds
     async fn force_rotate(&self) -> Result<()> {
+        // clear first: data written from here on may need another force rotation
+        self.force_rotate_pending.store(false, Ordering::Release);
         self.rotate_inner(0, 0, true).await
     }
 
@@ -736,7 +752,7 @@ impl Writer {
         force: bool,
     ) -> bool {
         if force {
-            return self.memtable.read().await.size().0 > 0;
+            return self.memtable.read().await.has_data();
         }
         self.check_wal_threshold(wal_size, entry_bytes_size)
             || self.check_mem_threshold(self.memtable.read().await.size(), entry_batch_size)
@@ -828,38 +844,47 @@ mod tests {
     }
 
     #[test]
-    fn test_should_force_rotate_only_when_full_and_nothing_to_persist() {
+    fn test_should_force_rotate_only_when_the_budget_is_exhausted() {
         let max = 2 * 1024 * 1024 * 1024;
-        // over the limit with nothing pending: only a rotation frees the budget
-        assert!(should_force_rotate(max as i64, max, 0));
-        assert!(should_force_rotate(max as i64 + 1, max, 0));
-        // pending immutables will free the budget once persisted
-        assert!(!should_force_rotate(max as i64, max, 1));
-        // under the limit
-        assert!(!should_force_rotate(max as i64 - 1, max, 0));
-        assert!(!should_force_rotate(0, max, 0));
+        assert!(should_force_rotate(max as i64, max));
+        assert!(should_force_rotate(max as i64 + 1, max));
+        assert!(!should_force_rotate(max as i64 - 1, max));
+        assert!(!should_force_rotate(0, max));
     }
 
     /// A writer whose wal lives in `dir`, without a consume loop.
     fn test_writer(dir: &std::path::Path) -> Writer {
-        let (tx, _rx) = mpsc::channel(1);
+        test_writer_with_queue(dir, "org").0
+    }
+
+    /// A writer whose wal lives in `dir`, and the receiving end of its write queue.
+    fn test_writer_with_queue(
+        dir: &std::path::Path,
+        org: &str,
+    ) -> (
+        Writer,
+        mpsc::Receiver<(WriterSignal, crate::ProcessedBatch, bool)>,
+    ) {
+        let (tx, rx) = mpsc::channel(8);
         let wal = WalWriter::new(
-            build_file_path(dir, "org", "logs", "1".to_string()),
+            build_file_path(dir, org, "logs", "1".to_string()),
             1024 * 1024,
             1024,
             None,
         )
         .unwrap()
         .0;
-        Writer {
+        let writer = Writer {
             idx: 0,
-            key: WriterKey::new_replay("org", "logs"),
+            key: WriterKey::new_replay(org, "logs"),
             wal: Arc::new(RwLock::new(wal)),
             memtable: Arc::new(RwLock::new(MemTable::new())),
             next_seq: AtomicU64::new(2),
             created_at: AtomicI64::new(Utc::now().timestamp_micros()),
+            force_rotate_pending: AtomicBool::new(false),
             write_queue: Arc::new(tx),
-        }
+        };
+        (writer, rx)
     }
 
     async fn write_one_row(writer: &Writer) {
@@ -913,5 +938,51 @@ mod tests {
         assert!(!writer.should_rotate(wal_size, 0, 0, false).await);
         // ...but rotates when forced, so its bytes can be persisted and freed
         assert!(writer.should_rotate(wal_size, 0, 0, true).await);
+    }
+
+    #[tokio::test]
+    async fn test_force_rotate_signal_moves_the_memtable_to_immutables() {
+        let dir = tempfile::tempdir().unwrap();
+        let (writer, rx) = test_writer_with_queue(dir.path(), "force_rotate_signal_test");
+        let writer = Arc::new(writer);
+        let consumer = tokio::spawn(Writer::consume_loop(writer.clone(), rx, 0));
+        let send = |sign| {
+            writer
+                .write_queue
+                .try_send((sign, crate::ProcessedBatch::empty(), false))
+                .unwrap()
+        };
+
+        write_one_row(&writer).await;
+        let old_wal = writer.wal.read().await.path().clone();
+        writer.force_rotate_pending.store(true, Ordering::Release);
+        send(WriterSignal::ForceRotate);
+
+        // the consume loop rotates the small, young memtable into IMMUTABLES
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !IMMUTABLES.read().await.contains_key(&old_wal) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "memtable was not rotated"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!writer.memtable.read().await.has_data());
+        assert!(!writer.force_rotate_pending.load(Ordering::Acquire));
+        let new_wal = writer.wal.read().await.path().clone();
+        assert_ne!(new_wal, old_wal);
+
+        // a force rotation of the now empty memtable is a no-op
+        send(WriterSignal::ForceRotate);
+        send(WriterSignal::Close);
+        consumer.await.unwrap();
+        assert_eq!(writer.wal.read().await.path(), &new_wal);
+
+        // clean up the global immutable and the new wal file under the configured wal dir
+        IMMUTABLES.write().await.swap_remove(&old_wal);
+        let _ = std::fs::remove_file(&new_wal);
+        if let Some(org_dir) = new_wal.parent().and_then(|p| p.parent()) {
+            let _ = std::fs::remove_dir_all(org_dir);
+        }
     }
 }

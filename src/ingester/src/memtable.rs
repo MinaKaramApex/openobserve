@@ -135,6 +135,12 @@ impl MemTable {
             self.arrow_bytes_written.load(Ordering::SeqCst) as usize,
         )
     }
+
+    // Whether anything was written into this memtable
+    pub(crate) fn has_data(&self) -> bool {
+        let (json_size, arrow_size) = self.size();
+        json_size > 0 || arrow_size > 0
+    }
 }
 
 impl MemorySize for MemTable {
