@@ -366,37 +366,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_immutables_cache_stats() {
-        // Test that get_immutables_cache_stats returns valid tuple structure
-        let (total_size, used_size, _item_len) = get_immutables_cache_stats().await;
-
-        // used_size should not exceed total_size
-        assert!(used_size <= total_size);
+        // stats() returns (len, capacity, mem_size)
+        let (len, capacity, mem_size) = get_immutables_cache_stats().await;
+        assert!(len <= capacity);
+        assert!(mem_size > 0);
     }
 
     #[tokio::test]
     async fn test_get_immutables_cache_stats_consistency() {
-        // Test that stats returns valid values across multiple calls
-        // Note: In a concurrent test environment, values may change due to other tests
-        let (total1, used1, len1) = get_immutables_cache_stats().await;
-        let (total2, used2, len2) = get_immutables_cache_stats().await;
-
-        // Total size should remain consistent
-        assert_eq!(total1, total2);
-
-        // Used size and length may change due to concurrent tests, but should not vary wildly
-        let used_diff = used2.abs_diff(used1);
-        let len_diff = len2.abs_diff(len1);
-        assert!(used_diff < 100000 || used1 == 0 || used2 == 0);
-        assert!(len_diff < 100 || len1 == 0 || len2 == 0);
+        // other tests insert into and remove from the shared map concurrently, so only
+        // invariants within each snapshot hold, not equality between snapshots
+        for _ in 0..2 {
+            let (len, capacity, mem_size) = get_immutables_cache_stats().await;
+            assert!(len <= capacity);
+            assert!(mem_size > 0);
+        }
     }
 
     #[tokio::test]
     async fn test_get_processing_tables_cache_stats() {
-        // Test that get_processing_tables_cache_stats returns valid tuple structure
-        let (total_size, used_size, _item_len) = get_processing_tables_cache_stats().await;
-
-        // used_size should not exceed total_size
-        assert!(used_size <= total_size);
+        // stats() returns (len, capacity, mem_size)
+        let (len, capacity, _mem_size) = get_processing_tables_cache_stats().await;
+        assert!(len <= capacity);
     }
 
     #[tokio::test]

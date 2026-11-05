@@ -69,20 +69,21 @@ pub fn check_memtable_size() -> Result<()> {
     let cur_mem = metrics::INGEST_MEMTABLE_ARROW_BYTES
         .with_label_values::<&str>(&[])
         .get();
-    if cur_mem >= get_config().limit.mem_table_max_size as i64 {
+    if memtable_budget_exhausted(cur_mem, get_config().limit.mem_table_max_size) {
         Err(Error::MemoryTableOverflowError {})
     } else {
         Ok(())
     }
 }
 
-/// Whether the memtable budget is exhausted, so the live memtables must be rotated to free it.
+/// Whether the memtable budget is exhausted: writes are rejected and the live memtables must be
+/// rotated to free it.
 ///
 /// The budget (`cur_mem`) counts live memtables plus immutables not yet persisted, and it only
 /// shrinks when an immutable is persisted. Once it is exhausted every write is rejected, so no
 /// write arrives to trigger a size rotation, and data in the live memtables stays counted until
 /// the ttl check rotates them.
-pub(crate) fn should_force_rotate(cur_mem: i64, max_size: usize) -> bool {
+pub(crate) fn memtable_budget_exhausted(cur_mem: i64, max_size: usize) -> bool {
     cur_mem >= max_size as i64
 }
 
@@ -97,13 +98,14 @@ pub(crate) async fn force_rotate_if_overflow() -> usize {
         .with_label_values::<&str>(&[])
         .get();
     let max_size = get_config().limit.mem_table_max_size;
-    if !should_force_rotate(cur_mem, max_size) {
+    if !memtable_budget_exhausted(cur_mem, max_size) {
         return 0;
     }
     let mut signalled = 0;
     for w in WRITERS.iter() {
-        let w = w.read().await;
-        for r in w.values() {
+        // do not hold the bucket lock while waiting for memtable locks
+        let writers = w.read().await.values().cloned().collect::<Vec<_>>();
+        for r in writers {
             if r.is_channel_closed() || !r.memtable.read().await.has_data() {
                 continue;
             }
@@ -118,8 +120,8 @@ pub(crate) async fn force_rotate_if_overflow() -> usize {
                 false,
             )) {
                 r.force_rotate_pending.store(false, Ordering::Release);
-                log::warn!(
-                    "[INGESTER:MEM:{}] writer queue force rotate skipped: {e}",
+                log::debug!(
+                    "[INGESTER:MEM:{}] writer queue force rotate skipped, retry next run: {e}",
                     r.idx
                 );
                 continue;
@@ -844,12 +846,12 @@ mod tests {
     }
 
     #[test]
-    fn test_should_force_rotate_only_when_the_budget_is_exhausted() {
+    fn test_memtable_budget_exhausted() {
         let max = 2 * 1024 * 1024 * 1024;
-        assert!(should_force_rotate(max as i64, max));
-        assert!(should_force_rotate(max as i64 + 1, max));
-        assert!(!should_force_rotate(max as i64 - 1, max));
-        assert!(!should_force_rotate(0, max));
+        assert!(memtable_budget_exhausted(max as i64, max));
+        assert!(memtable_budget_exhausted(max as i64 + 1, max));
+        assert!(!memtable_budget_exhausted(max as i64 - 1, max));
+        assert!(!memtable_budget_exhausted(0, max));
     }
 
     /// A writer whose wal lives in `dir`, without a consume loop.
@@ -960,29 +962,36 @@ mod tests {
 
         // the consume loop rotates the small, young memtable into IMMUTABLES
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !IMMUTABLES.read().await.contains_key(&old_wal) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "memtable was not rotated"
-            );
+        let mut rotated = false;
+        while std::time::Instant::now() < deadline {
+            if IMMUTABLES.read().await.contains_key(&old_wal) {
+                rotated = true;
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(!writer.memtable.read().await.has_data());
-        assert!(!writer.force_rotate_pending.load(Ordering::Acquire));
+        let memtable_emptied = !writer.memtable.read().await.has_data();
+        let pending_cleared = !writer.force_rotate_pending.load(Ordering::Acquire);
         let new_wal = writer.wal.read().await.path().clone();
-        assert_ne!(new_wal, old_wal);
 
         // a force rotation of the now empty memtable is a no-op
         send(WriterSignal::ForceRotate);
         send(WriterSignal::Close);
         consumer.await.unwrap();
-        assert_eq!(writer.wal.read().await.path(), &new_wal);
+        let final_wal = writer.wal.read().await.path().clone();
 
-        // clean up the global immutable and the new wal file under the configured wal dir
+        // clean up before asserting: the immutable is global, and the new wal file is written
+        // under the configured wal dir
         IMMUTABLES.write().await.swap_remove(&old_wal);
         let _ = std::fs::remove_file(&new_wal);
         if let Some(org_dir) = new_wal.parent().and_then(|p| p.parent()) {
             let _ = std::fs::remove_dir_all(org_dir);
         }
+
+        assert!(rotated, "memtable was not rotated");
+        assert!(memtable_emptied);
+        assert!(pending_cleared);
+        assert_ne!(new_wal, old_wal);
+        assert_eq!(final_wal, new_wal);
     }
 }
