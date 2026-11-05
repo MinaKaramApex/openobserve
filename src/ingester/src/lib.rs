@@ -63,6 +63,9 @@ pub static WAL_DIR_DEFAULT_PREFIX: &str = "logs";
 pub enum WriterSignal {
     Produce,
     Rotate,
+    /// Rotate the memtable if it holds any data, regardless of the size and age thresholds.
+    /// Sent when the memtable budget is exhausted and nothing is left to persist.
+    ForceRotate,
     Close,
 }
 
@@ -197,6 +200,12 @@ async fn run() -> errors::Result<()> {
             config::get_config().limit.mem_persist_interval,
         ))
         .await;
+        // the memtable budget counts live memtables plus immutables not yet persisted. When it is
+        // exhausted and nothing is left to persist, every write is rejected, so no write arrives to
+        // trigger a size rotation: rotate now instead of waiting for the next ttl check.
+        if let Err(e) = writer::force_rotate_if_overflow().await {
+            log::error!("memtable force rotate error: {e}");
+        }
         // persist immutable data to disk
         if let Err(e) = immutable::persist(tx.clone()).await {
             log::error!("immutable persist error: {e}");

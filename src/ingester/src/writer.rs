@@ -74,6 +74,54 @@ pub fn check_memtable_size() -> Result<()> {
     }
 }
 
+/// Whether the memtables must be rotated now to free the memtable budget.
+///
+/// The budget (`cur_mem`) counts live memtables plus immutables not yet persisted, and it only
+/// shrinks when an immutable is persisted. Once it is exhausted every write is rejected, so no
+/// write arrives to trigger a size rotation. While immutables are pending, persisting them frees
+/// the budget; when none are pending, nothing will until the live memtables are rotated.
+pub(crate) fn should_force_rotate(
+    cur_mem: i64,
+    max_size: usize,
+    pending_immutables: usize,
+) -> bool {
+    cur_mem >= max_size as i64 && pending_immutables == 0
+}
+
+/// Rotate every non-empty memtable when the memtable budget is exhausted and nothing is left to
+/// persist, so the next persist run frees the budget. Returns whether a rotation was requested.
+pub async fn force_rotate_if_overflow() -> Result<bool> {
+    let cur_mem = metrics::INGEST_MEMTABLE_ARROW_BYTES
+        .with_label_values::<&str>(&[])
+        .get();
+    let max_size = get_config().limit.mem_table_max_size;
+    let pending = IMMUTABLES.read().await.len();
+    if !should_force_rotate(cur_mem, max_size, pending) {
+        return Ok(false);
+    }
+    log::warn!(
+        "[INGESTER:MEM] memtable size {cur_mem} reached the limit {max_size} with nothing to persist, force rotating memtables"
+    );
+    for w in WRITERS.iter() {
+        let w = w.read().await;
+        for r in w.values() {
+            // never block the persist loop: a full queue means writes are still arriving,
+            // and they trigger the size rotation themselves
+            if let Err(e) = r.write_queue.try_send((
+                WriterSignal::ForceRotate,
+                crate::ProcessedBatch::empty(),
+                false,
+            )) {
+                log::warn!(
+                    "[INGESTER:MEM:{}] writer queue force rotate skipped: {e}",
+                    r.idx
+                );
+            }
+        }
+    }
+    Ok(true)
+}
+
 // check total memory size
 pub fn check_memory_circuit_breaker() -> Result<()> {
     let cfg = get_config();
@@ -349,6 +397,11 @@ impl Writer {
                             log::error!("[INGESTER:MEM:{idx}] writer rotate error: {e}");
                         }
                     }
+                    WriterSignal::ForceRotate => {
+                        if let Err(e) = writer.force_rotate().await {
+                            log::error!("[INGESTER:MEM:{idx}] writer force rotate error: {e}");
+                        }
+                    }
                     WriterSignal::Produce => {
                         if let Err(e) = writer.consume_processed(batch, fsync).await {
                             log::error!("[INGESTER:MEM:{idx}] writer consume batch error: {e}");
@@ -537,9 +590,25 @@ impl Writer {
 
     // rotate is used to rotate the wal and memtable if the size exceeds the threshold
     async fn rotate(&self, entry_bytes_size: usize, entry_batch_size: usize) -> Result<()> {
+        self.rotate_inner(entry_bytes_size, entry_batch_size, false)
+            .await
+    }
+
+    // force_rotate rotates the wal and memtable if the memtable holds any data, regardless of
+    // the size and age thresholds
+    async fn force_rotate(&self) -> Result<()> {
+        self.rotate_inner(0, 0, true).await
+    }
+
+    async fn rotate_inner(
+        &self,
+        entry_bytes_size: usize,
+        entry_batch_size: usize,
+        force: bool,
+    ) -> Result<()> {
         let wal_size = self.wal.read().await.size();
         if !self
-            .should_rotate(wal_size, entry_bytes_size, entry_batch_size)
+            .should_rotate(wal_size, entry_bytes_size, entry_batch_size, force)
             .await
         {
             return Ok(());
@@ -554,7 +623,7 @@ impl Writer {
             .observe(wal_lock_time);
         // check again to avoid race condition
         if !self
-            .should_rotate(wal.size(), entry_bytes_size, entry_batch_size)
+            .should_rotate(wal.size(), entry_bytes_size, entry_batch_size, force)
             .await
         {
             return Ok(());
@@ -657,12 +726,18 @@ impl Writer {
     /// `rotate()` calls this twice - before and after taking the wal write lock - and both
     /// calls must check the same thresholds, otherwise memtable-triggered rotations would
     /// be dropped by the re-check.
+    ///
+    /// With `force`, any memtable holding data rotates, whatever its size and age.
     async fn should_rotate(
         &self,
         wal_size: (usize, usize),
         entry_bytes_size: usize,
         entry_batch_size: usize,
+        force: bool,
     ) -> bool {
+        if force {
+            return self.memtable.read().await.size().0 > 0;
+        }
         self.check_wal_threshold(wal_size, entry_bytes_size)
             || self.check_mem_threshold(self.memtable.read().await.size(), entry_batch_size)
     }
@@ -750,5 +825,93 @@ mod tests {
         let key = WriterKey::new_replay("abc", "xyz");
         let min_expected = std::mem::size_of::<WriterKey>() + "abc".len() + "xyz".len();
         assert_eq!(key.mem_size(), min_expected);
+    }
+
+    #[test]
+    fn test_should_force_rotate_only_when_full_and_nothing_to_persist() {
+        let max = 2 * 1024 * 1024 * 1024;
+        // over the limit with nothing pending: only a rotation frees the budget
+        assert!(should_force_rotate(max as i64, max, 0));
+        assert!(should_force_rotate(max as i64 + 1, max, 0));
+        // pending immutables will free the budget once persisted
+        assert!(!should_force_rotate(max as i64, max, 1));
+        // under the limit
+        assert!(!should_force_rotate(max as i64 - 1, max, 0));
+        assert!(!should_force_rotate(0, max, 0));
+    }
+
+    /// A writer whose wal lives in `dir`, without a consume loop.
+    fn test_writer(dir: &std::path::Path) -> Writer {
+        let (tx, _rx) = mpsc::channel(1);
+        let wal = WalWriter::new(
+            build_file_path(dir, "org", "logs", "1".to_string()),
+            1024 * 1024,
+            1024,
+            None,
+        )
+        .unwrap()
+        .0;
+        Writer {
+            idx: 0,
+            key: WriterKey::new_replay("org", "logs"),
+            wal: Arc::new(RwLock::new(wal)),
+            memtable: Arc::new(RwLock::new(MemTable::new())),
+            next_seq: AtomicU64::new(2),
+            created_at: AtomicI64::new(Utc::now().timestamp_micros()),
+            write_queue: Arc::new(tx),
+        }
+    }
+
+    async fn write_one_row(writer: &Writer) {
+        use arrow::{array::Int64Array, record_batch::RecordBatch};
+        use arrow_schema::{DataType, Field};
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            config::TIMESTAMP_COL_NAME,
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![
+                Utc::now().timestamp_micros(),
+            ]))],
+        )
+        .unwrap();
+        let entry = crate::Entry {
+            org_id: Arc::from("org"),
+            stream: Arc::from("stream"),
+            schema: Some(schema.clone()),
+            schema_key: Arc::from("key"),
+            partition_key: Arc::from("2026/01/01/00"),
+            data: vec![],
+            data_size: 16,
+            batch: None,
+        };
+        let batch_entry = crate::entry::RecordBatchEntry::new(Arc::from("logs"), batch, 16, 64);
+        writer
+            .memtable
+            .write()
+            .await
+            .write(schema, entry, batch_entry)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_force_rotate_ignores_size_and_age_thresholds() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = test_writer(dir.path());
+
+        // an empty memtable never rotates, forced or not
+        let wal_size = writer.wal.read().await.size();
+        assert!(!writer.should_rotate(wal_size, 0, 0, false).await);
+        assert!(!writer.should_rotate(wal_size, 0, 0, true).await);
+
+        // a small, young memtable stays below the size and age thresholds...
+        write_one_row(&writer).await;
+        let wal_size = writer.wal.read().await.size();
+        assert!(!writer.should_rotate(wal_size, 0, 0, false).await);
+        // ...but rotates when forced, so its bytes can be persisted and freed
+        assert!(writer.should_rotate(wal_size, 0, 0, true).await);
     }
 }
